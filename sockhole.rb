@@ -16,11 +16,23 @@
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 #
 
+require "eventmachine"
 require "socket"
 require "logger"
 require "ipaddr"
 require "resolv"
 require "openssl"
+
+# a connection to these ports will make a TLS connection and decrypt data
+# before handing it back to the client
+TLS_PORTS = [
+  443, # https
+  993, # imaps
+  995, # pop3s
+]
+
+LISTEN_PORT = 1080
+LISTEN_IP = "0.0.0.0"
 
 LOGGER = Logger.new(STDOUT)
 if ARGV[0] == "-d"
@@ -33,21 +45,12 @@ LOGGER.formatter = proc do |severity, datetime, progname, msg|
   "[#{datetime}] [#{severity[0]}] #{msg}\n"
 end
 
-# a connection to these ports will make a TLS connection and decrypt data
-# before handing it back to the client
-TLS_PORTS = [
-  443, # https
-  993, # imaps
-  995, # pop3s
-]
-
-BUF_SIZE = 512
-
 VERSION_SOCKS5 = 0x05
 
-METHOD_MIN_REQUEST_LENGTH = 3
+METHOD_MIN_LENGTH = 3
 METHOD_AUTH_NONE = 0x0
 
+REQUEST_MIN_LENGTH = 9
 REQUEST_COMMAND_CONNECT = 0x1
 REQUEST_ATYP_IP = 0x1
 REQUEST_ATYP_HOSTNAME = 0x3
@@ -69,77 +72,104 @@ class NilClass
   end
 end
 
-class Server
-  def self.log(prio, str)
-    LOGGER.send(prio, "[server] #{str}")
+class ClientDead < StandardError; end
+
+module EMProxyConnection
+  attr_reader :client, :hostname, :connected, :tls, :did_tls_verification
+
+  def initialize(client, hostname, tls)
+    @client = client
+    @hostname = hostname
+    @connected = false
+    @tls = tls
+    @did_tls_verification = false
   end
 
-  def self.run!
-    server = TCPServer.new(1080)
+  def post_init
+    if tls
+      start_tls(:verify_peer => true, :cert_chain_file => "/etc/ssl/cert.pem")
+    end
+  end
 
-    log :info, "listening on :1080"
+  def log(prio, str)
+    client.log(prio, str)
+  end
 
-    while tcpsocket = server.accept do
-      Thread.new {
-        begin
-          Client.new(tcpsocket)
-        rescue => e
-          log :error, "unhandled #{e.class} exception in client: " <<
-            "#{e.message}"
-          e.backtrace[0, 4].each{|l| log :error, "  #{l}" }
-        end
-      }.join
+  def connection_completed
+    @connected = true
+
+    # tls connections will call back once verification completes
+    if !tls
+      client.send_reply REPLY_SUCCESS
+    end
+  end
+
+  def ssl_verify_peer(pem)
+    if hostname.empty?
+      return true
+    end
+
+    # we'll get called again for other certs in the chain
+    if did_tls_verification
+      return true
+    end
+
+    log :debug, "verifying TLS hostname #{hostname.inspect}"
+
+    cert = OpenSSL::X509::Certificate.new(pem)
+    ret = OpenSSL::SSL.verify_certificate_identity(cert, hostname)
+
+    @did_tls_verification = true
+
+    # XXX: this always seems to fail, even when no OpenSSL error is reported
+    if !ret
+      log :warn, "TLS verification failed for #{hostname.inspect}, aborting"
+      #close_connection
+      #return false
+    end
+
+    return ret
+
+  rescue => e
+    log :warn, "error in ssl_verify_peer: #{e.inspect}"
+    return false
+  end
+
+  def ssl_handshake_completed
+    log :debug, "TLS handshake completed, sending reply"
+    client.send_reply REPLY_SUCCESS
+  end
+
+  def receive_data(_data)
+    client.send_data _data
+  end
+
+  def unbind
+    if connected
+      log :info, "closed remote connection"
+      client.close_connection_after_writing
+    else
+      log :info, "failed connecting to remote"
+      client.send_reply REPLY_FAIL
     end
   end
 end
 
-class ClientDead < StandardError; end
-
-class Client
-  attr_reader :socket, :ip, :remote_socket, :tls_decrypt
+module EMSOCKS5Connection
+  attr_reader :state, :ip, :data, :remote_connection, :tls_decrypt
   attr_accessor :remote_hostname, :remote_ip, :remote_port
 
-  def initialize(tcpsocket)
-    @socket = tcpsocket
-    @ip = @socket.peeraddr[2]
-
-    log :info, "new connection"
-
-    if !verify_method
-      close
-      return
-    end
-
-    handle_request
-    close
-    return
-
-  rescue ClientDead
-    close
-    return
+  def initialize
+    @state = :INIT
+    port, @ip = Socket.unpack_sockaddr_in(get_peername)
   end
 
   def log(prio, str)
     LOGGER.send(prio, "[#{ip}] #{str}")
   end
 
-  def close
-    if socket
-      log :info, "closing connection"
-      socket.close
-    end
-
-    if remote_socket
-      log :info, "closing remote connection"
-      remote_socket.close
-    end
-
-    @socket = nil
-    @remote_socket = nil
-  end
-
   def fail_close(code)
-    write [
+    send_data [
       VERSION_SOCKS5,
       code,
       0,
@@ -148,72 +178,62 @@ class Client
       0, 0,
     ].pack("C*")
 
-    close
-
-    return false
+    close_connection_after_writing
+    @state = :DEAD
   end
 
   def hex(data)
     data.unpack("C*").map{|c| sprintf("%02x", c) }.join(" ")
   end
 
-  def read(len)
-    data = socket.sysread(BUF_SIZE)
-    log :debug, "<-C #{hex(data)}"
-    return data
-  rescue SystemCallError, EOFError => e
-    log :error, "read: #{e.message}"
-    raise ClientDead
-  end
+  def send_reply(code)
+    resp = [ VERSION_SOCKS5, code, 0, REQUEST_ATYP_IP ]
+    resp += IPAddr.new(remote_ip).hton.unpack("C*")
+    resp += remote_port.to_s.unpack("n2").map(&:to_i)
+    send_data resp.pack("C*")
 
-  def write(data)
-    log :debug, "->C #{hex(data)}"
-    wrote = 0
-    while data.bytesize > 0
-      log :debug, "#{data.bytesize} byte(s) left to write to client"
-      len = socket.syswrite(data[0, BUF_SIZE])
-      data = data.byteslice(len .. -1)
-      wrote += len
+    if code == REPLY_SUCCESS
+      @state = :PROXY
+      @data = ""
+    else
+      close_connection_after_writing
+      @state = :DEAD
     end
-  rescue SystemCallError => e
-    log :error, "write: #{e.message}"
-    raise ClientDead
   end
 
-  def remote_read(len)
-    raise ClientDead if !remote_socket
-    data = remote_socket.sysread(BUF_SIZE)
-    log :debug, "<-R #{data.inspect}"
-    return data
-  rescue SystemCallError => e
-    log :error, "remote read: #{e.message}"
-    raise ClientDead
-  rescue EOFError => e
-    log :error, "remote EOF"
-    raise ClientDead
-  end
+  def receive_data(_data)
+    log :debug, "<-C #{_data.inspect} #{hex(_data)}"
 
-  def remote_write(data)
-    raise ClientDead if !remote_socket
-    log :debug, "->R #{hex(data)}"
-    wrote = 0
-    while data.bytesize > 0
-      log :debug, "#{data.bytesize} byte(s) left to write to remote"
-      len = remote_socket.syswrite(data[0, BUF_SIZE])
-      data = data.byteslice(len .. -1)
-      wrote += len
+    (@data ||= "") << _data
+
+    case state
+    when :INIT
+      if data.bytesize < METHOD_MIN_LENGTH
+        return
+      end
+
+      @state = :METHOD
+      verify_method
+
+    when :REQUEST
+      if data.bytesize < REQUEST_MIN_LENGTH
+        return
+      end
+
+      handle_request
+
+    when :PROXY
+      remote_connection.send_data data
+      @data = ""
     end
-  rescue SystemCallError => e
-    log :error, "remote write: #{e.message}"
-    raise ClientDead
+  end
+
+  def send_data(_data)
+    log :debug, "->C #{_data.inspect} #{hex(_data)}"
+    super
   end
 
   def verify_method
-    data = ""
-    while data.bytesize < METHOD_MIN_REQUEST_LENGTH
-      data << read(METHOD_MIN_REQUEST_LENGTH)
-    end
-
     if data[0].ord != VERSION_SOCKS5
       log :error, "unsupported version: #{data[0].inspect}"
       return fail_close(REPLY_FAIL)
@@ -222,18 +242,18 @@ class Client
     data[1].ord.times do |i|
       case data[2 + i].ord
       when METHOD_AUTH_NONE
-        write [ VERSION_SOCKS5, METHOD_AUTH_NONE ].pack("C*")
-        return true
+        send_data [ VERSION_SOCKS5, METHOD_AUTH_NONE ].pack("C*")
+        @state = :REQUEST
+        @data = ""
+        return
       end
     end
 
     log :error, "no supported auth methods"
-    return fail_close(REPLY_FAIL)
+    fail_close(REPLY_FAIL)
   end
 
   def handle_request
-    data = read(BUF_SIZE)
-
     if data[0].ord != VERSION_SOCKS5
       log :error, "unsupported request version: #{data[0].inspect}"
       return fail_close(REPLY_FAIL)
@@ -315,69 +335,22 @@ class Client
     end
     log :info, l
 
-    begin
-      Timeout.timeout(5) do
-        @remote_socket = TCPSocket.new(remote_ip, remote_port)
+    # this will call back with send_reply(REPLY_SUCCESS) once connected
+    @remote_connection = EventMachine.connect(remote_ip, remote_port,
+      EMProxyConnection, self, remote_hostname, tls_decrypt)
+  end
 
-        if tls_decrypt
-          ctx = OpenSSL::SSL::SSLContext.new
-          # verification doesn't make sense without a hostname
-          if remote_hostname
-            ctx.set_params(:verify_mode => OpenSSL::SSL::VERIFY_PEER)
-          end
-
-          ssl_socket = OpenSSL::SSL::SSLSocket.new(remote_socket, ctx)
-          ssl_socket.hostname = remote_hostname ? remote_hostname : remote_ip
-          ssl_socket.sync_close = true
-          ssl_socket.connect
-          @remote_socket = ssl_socket
-        end
-      end
-    rescue Timeout::Error => e
-      log :error, "connection to #{remote_ip}:#{remote_port} failed: " <<
-        e.message
-      return fail_close(REPLY_TTL_EXPIRED)
-    rescue Errno::ECONNREFUSED => e
-      log :error, "connection to #{remote_ip}:#{remote_port} failed: " <<
-        e.message
-      return fail_close(REPLY_CONN_REFUSED)
-    rescue OpenSSL::SSL::SSLError => e
-      log :error, "TLS failure: #{e.message}"
-      return fail_close(REPLY_CONN_REFUSED)
+  def unbind
+    if remote_connection
+      remote_connection.close_connection
     end
 
-    resp = [ VERSION_SOCKS5, REPLY_SUCCESS, 0, REQUEST_ATYP_IP ]
-    resp += IPAddr.new(remote_ip).hton.unpack("C*")
-    resp += remote_port.to_s.unpack("n2").map(&:to_i)
-    write resp.pack("C*")
-
-    loop do
-      log :debug, "selecting"
-
-      r, w, e = IO.select([ socket, remote_socket ])
-
-      r.each do |io|
-        case io
-        when socket
-          log :debug, "need to read from client socket"
-          data = read(BUF_SIZE)
-          log :debug, "read #{data.bytesize} from client"
-          remote_write(data)
-
-        when remote_socket
-          log :debug, "need to read from remote socket"
-          data = remote_read(BUF_SIZE)
-          log :debug, "read #{data.bytesize} from remote: #{data.inspect}"
-          write(data)
-        end
-      end
-
-      if e.any?
-        log :error, "select failed, closing"
-        return close
-      end
-    end
+    log :info, "closed connection"
   end
 end
 
-Server.run!
+EM.kqueue = true
+EM.run do
+  EM.start_server(LISTEN_IP, LISTEN_PORT, EMSOCKS5Connection)
+  LOGGER.info "[server] listening on #{LISTEN_IP}:#{LISTEN_PORT}"
+end
