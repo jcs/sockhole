@@ -26,6 +26,8 @@ port configured in the POP3 client to 995 (POP3S).
 
 	server$ bundle exec ruby sockhole.rb
 
+The `-d` option can be supplied to print debugging information.
+
 ### Client Examples
 
 #### Curl
