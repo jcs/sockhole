@@ -31,8 +31,17 @@ TLS_PORTS = [
   995, # pop3s
 ]
 
+# by default, listen on the first non-loopback IPv4 address we can find or
+# fallback to 127.0.0.1
 LISTEN_PORT = 1080
-LISTEN_IP = "0.0.0.0"
+LISTEN_IP = (Socket.ip_address_list.select{|a| a.ipv4? && !a.ipv4_loopback? }
+  .map{|i| i.ip_unpack[0] }.first || "127.0.0.1")
+
+# and limit connections from IPs on our local /24 network
+ALLOWED_IPS = [
+  "127.0.0.1/32",
+  "#{LISTEN_IP}/24",
+]
 
 LOGGER = Logger.new(STDOUT)
 if ARGV[0] == "-d"
@@ -162,6 +171,23 @@ module EMSOCKS5Connection
   def initialize
     @state = :INIT
     port, @ip = Socket.unpack_sockaddr_in(get_peername)
+
+    if !allow_connection?
+      # TODO: does eventmachine have a way to prevent the connection from even
+      # happening in the first place?
+      log :warn, "connection from #{ip} denied, not in allow list"
+      close_connection
+    end
+  end
+
+  def allow_connection?
+    ALLOWED_IPS.each do |r|
+      if IPAddr.new(r).to_range.include?(ip)
+        return true
+      end
+    end
+
+    false
   end
 
   def log(prio, str)
