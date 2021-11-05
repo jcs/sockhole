@@ -84,7 +84,8 @@ end
 class ClientDead < StandardError; end
 
 module EMProxyConnection
-  attr_reader :client, :hostname, :connected, :tls, :did_tls_verification
+  attr_reader :client, :hostname, :connected, :tls, :certificate_store,
+    :last_cert
 
   def initialize(client, hostname, tls)
     @client = client
@@ -92,12 +93,10 @@ module EMProxyConnection
     @connected = false
     @tls = tls
     @did_tls_verification = false
-  end
+    @last_cert = nil
 
-  def post_init
-    if tls
-      start_tls(:verify_peer => true, :cert_chain_file => ssl_cert_chain_file)
-    end
+    @certificate_store = OpenSSL::X509::Store.new
+    @certificate_store.set_default_paths
   end
 
   def connection_completed
@@ -113,40 +112,37 @@ module EMProxyConnection
     client.log(prio, str)
   end
 
+  def post_init
+    if tls
+      start_tls(:verify_peer => true, :sni_hostname => hostname)
+    end
+  end
+
   def receive_data(_data)
     client.send_data _data
   end
 
   def ssl_handshake_completed
-    log :debug, "TLS handshake completed, sending reply"
+    if !last_cert ||
+    !OpenSSL::SSL.verify_certificate_identity(last_cert, hostname)
+      log :warn, "TLS verification failed for #{hostname.inspect}, aborting"
+      close_connection
+      return
+    end
+
+    log :info, "TLS verification succeeded for #{hostname.inspect}, sending reply"
     client.send_reply REPLY_SUCCESS
   end
 
   def ssl_verify_peer(pem)
-    if hostname.empty?
-      return true
-    end
-
-    # we'll get called again for other certs in the chain
-    if did_tls_verification
-      return true
-    end
-
-    log :debug, "verifying TLS hostname #{hostname.inspect}"
-
     cert = OpenSSL::X509::Certificate.new(pem)
-    ret = OpenSSL::SSL.verify_certificate_identity(cert, hostname)
 
-    @did_tls_verification = true
-
-    # XXX: this always seems to fail, even when no OpenSSL error is reported
-    if !ret
-      log :warn, "TLS verification failed for #{hostname.inspect}, aborting"
-      #close_connection
-      #return false
+    if certificate_store.verify(cert)
+      @last_cert = cert
+      certificate_store.add_cert(cert)
     end
 
-    return ret
+    return true
 
   rescue => e
     log :warn, "error in ssl_verify_peer: #{e.inspect}"
