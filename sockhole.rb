@@ -96,7 +96,7 @@ module EMProxyConnection
 
   def post_init
     if tls
-      start_tls(:verify_peer => true, :cert_chain_file => "/etc/ssl/cert.pem")
+      start_tls(:verify_peer => true, :cert_chain_file => ssl_cert_chain_file)
     end
   end
 
@@ -161,6 +161,17 @@ module EMProxyConnection
       log :info, "failed connecting to remote"
       client.send_reply REPLY_FAIL
     end
+  end
+
+private
+  def ssl_cert_chain_file
+    [ "/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt" ].each do |f|
+      if File.exists?(f)
+        return f
+      end
+    end
+
+    nil
   end
 end
 
@@ -375,7 +386,10 @@ module EMSOCKS5Connection
   end
 end
 
-EM.kqueue = true
+if RUBY_PLATFORM.match(/bsd/i)
+  EM.kqueue = true
+end
+
 EM.run do
   EM.start_server(LISTEN_IP, LISTEN_PORT, EMSOCKS5Connection)
   LOGGER.info "[server] listening on #{LISTEN_IP}:#{LISTEN_PORT}"
