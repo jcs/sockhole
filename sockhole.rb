@@ -100,10 +100,6 @@ module EMProxyConnection
     end
   end
 
-  def log(prio, str)
-    client.log(prio, str)
-  end
-
   def connection_completed
     @connected = true
 
@@ -111,6 +107,19 @@ module EMProxyConnection
     if !tls
       client.send_reply REPLY_SUCCESS
     end
+  end
+
+  def log(prio, str)
+    client.log(prio, str)
+  end
+
+  def receive_data(_data)
+    client.send_data _data
+  end
+
+  def ssl_handshake_completed
+    log :debug, "TLS handshake completed, sending reply"
+    client.send_reply REPLY_SUCCESS
   end
 
   def ssl_verify_peer(pem)
@@ -142,15 +151,6 @@ module EMProxyConnection
   rescue => e
     log :warn, "error in ssl_verify_peer: #{e.inspect}"
     return false
-  end
-
-  def ssl_handshake_completed
-    log :debug, "TLS handshake completed, sending reply"
-    client.send_reply REPLY_SUCCESS
-  end
-
-  def receive_data(_data)
-    client.send_data _data
   end
 
   def unbind
@@ -201,8 +201,23 @@ module EMSOCKS5Connection
     false
   end
 
-  def log(prio, str)
-    LOGGER.send(prio, "[#{ip}] #{str}")
+  def do_connect
+    if TLS_PORTS.include?(remote_port)
+      @tls_decrypt = true
+    end
+
+    l = "connecting to " << remote_ip << ":" << remote_port.to_s
+    if remote_hostname
+      l << " (#{remote_hostname})"
+    end
+    if tls_decrypt
+      l << " (TLS decrypt)"
+    end
+    log :info, l
+
+    # this will call back with send_reply(REPLY_SUCCESS) once connected
+    @remote_connection = EventMachine.connect(remote_ip, remote_port,
+      EMProxyConnection, self, remote_hostname, tls_decrypt)
   end
 
   def fail_close(code)
@@ -217,77 +232,6 @@ module EMSOCKS5Connection
 
     close_connection_after_writing
     @state = :DEAD
-  end
-
-  def hex(data)
-    data.unpack("C*").map{|c| sprintf("%02x", c) }.join(" ")
-  end
-
-  def send_reply(code)
-    resp = [ VERSION_SOCKS5, code, 0, REQUEST_ATYP_IP ]
-    resp += IPAddr.new(remote_ip).hton.unpack("C*")
-    resp += remote_port.to_s.unpack("n2").map(&:to_i)
-    send_data resp.pack("C*")
-
-    if code == REPLY_SUCCESS
-      @state = :PROXY
-      @data = ""
-    else
-      close_connection_after_writing
-      @state = :DEAD
-    end
-  end
-
-  def receive_data(_data)
-    log :debug, "<-C #{_data.inspect} #{hex(_data)}"
-
-    (@data ||= "") << _data
-
-    case state
-    when :INIT
-      if data.bytesize < METHOD_MIN_LENGTH
-        return
-      end
-
-      @state = :METHOD
-      verify_method
-
-    when :REQUEST
-      if data.bytesize < REQUEST_MIN_LENGTH
-        return
-      end
-
-      handle_request
-
-    when :PROXY
-      remote_connection.send_data data
-      @data = ""
-    end
-  end
-
-  def send_data(_data)
-    log :debug, "->C #{_data.inspect} #{hex(_data)}"
-    super
-  end
-
-  def verify_method
-    if data[0].ord != VERSION_SOCKS5
-      log :error, "unsupported version: #{data[0].inspect}"
-      return fail_close(REPLY_FAIL)
-    end
-
-    data[1].ord.times do |i|
-      case data[2 + i].ord
-      when METHOD_AUTH_NONE
-        send_data [ VERSION_SOCKS5, METHOD_AUTH_NONE ].pack("C*")
-        @state = :REQUEST
-        @data = ""
-        return
-      end
-    end
-
-    log :error, "no supported auth methods"
-    fail_close(REPLY_FAIL)
   end
 
   def handle_request
@@ -358,23 +302,59 @@ module EMSOCKS5Connection
     end
   end
 
-  def do_connect
-    if TLS_PORTS.include?(remote_port)
-      @tls_decrypt = true
-    end
+  def hex(data)
+    data.unpack("C*").map{|c| sprintf("%02x", c) }.join(" ")
+  end
 
-    l = "connecting to " << remote_ip << ":" << remote_port.to_s
-    if remote_hostname
-      l << " (#{remote_hostname})"
-    end
-    if tls_decrypt
-      l << " (TLS decrypt)"
-    end
-    log :info, l
+  def log(prio, str)
+    LOGGER.send(prio, "[#{ip}] #{str}")
+  end
 
-    # this will call back with send_reply(REPLY_SUCCESS) once connected
-    @remote_connection = EventMachine.connect(remote_ip, remote_port,
-      EMProxyConnection, self, remote_hostname, tls_decrypt)
+  def receive_data(_data)
+    log :debug, "<-C #{_data.inspect} #{hex(_data)}"
+
+    (@data ||= "") << _data
+
+    case state
+    when :INIT
+      if data.bytesize < METHOD_MIN_LENGTH
+        return
+      end
+
+      @state = :METHOD
+      verify_method
+
+    when :REQUEST
+      if data.bytesize < REQUEST_MIN_LENGTH
+        return
+      end
+
+      handle_request
+
+    when :PROXY
+      remote_connection.send_data data
+      @data = ""
+    end
+  end
+
+  def send_data(_data)
+    log :debug, "->C #{_data.inspect} #{hex(_data)}"
+    super
+  end
+
+  def send_reply(code)
+    resp = [ VERSION_SOCKS5, code, 0, REQUEST_ATYP_IP ]
+    resp += IPAddr.new(remote_ip).hton.unpack("C*")
+    resp += remote_port.to_s.unpack("n2").map(&:to_i)
+    send_data resp.pack("C*")
+
+    if code == REPLY_SUCCESS
+      @state = :PROXY
+      @data = ""
+    else
+      close_connection_after_writing
+      @state = :DEAD
+    end
   end
 
   def unbind
@@ -383,6 +363,26 @@ module EMSOCKS5Connection
     end
 
     log :info, "closed connection"
+  end
+
+  def verify_method
+    if data[0].ord != VERSION_SOCKS5
+      log :error, "unsupported version: #{data[0].inspect}"
+      return fail_close(REPLY_FAIL)
+    end
+
+    data[1].ord.times do |i|
+      case data[2 + i].ord
+      when METHOD_AUTH_NONE
+        send_data [ VERSION_SOCKS5, METHOD_AUTH_NONE ].pack("C*")
+        @state = :REQUEST
+        @data = ""
+        return
+      end
+    end
+
+    log :error, "no supported auth methods"
+    fail_close(REPLY_FAIL)
   end
 end
 
