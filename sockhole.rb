@@ -171,7 +171,7 @@ private
       end
     end
 
-    nil
+    raise "can't find ssl certificate chain file"
   end
 end
 
@@ -384,6 +384,10 @@ module EMSOCKS5Connection
     log :error, "no supported auth methods"
     fail_close(REPLY_FAIL)
   end
+end
+
+if !EM.ssl?
+  raise "EventMachine was not compiled with SSL support"
 end
 
 if RUBY_PLATFORM.match(/bsd/i)
