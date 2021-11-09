@@ -23,32 +23,74 @@ require "ipaddr"
 require "resolv"
 require "openssl"
 
-# a connection to these ports will make a TLS connection and decrypt data
-# before handing it back to the client
-TLS_PORTS = [
-  443, # https
-  993, # imaps
-  995, # pop3s
-]
+def usage
+  STDERR.puts "usage: #{$0} [-a allowed range] [-d] [-p port] [-i ip]"
+  exit 1
+end
 
-# by default, listen on the first non-loopback IPv4 address we can find or
-# fallback to 127.0.0.1
-LISTEN_PORT = 1080
-LISTEN_IP = (Socket.ip_address_list.select{|a| a.ipv4? && !a.ipv4_loopback? }
-  .map{|i| i.ip_unpack[0] }.first || "127.0.0.1")
+CONFIG = {
+  # a connection to these ports will make a TLS connection and decrypt data
+  # before handing it back to the client
+  :tls_ports => [
+    443, # https
+    993, # imaps
+    995, # pop3s
+  ],
 
-# and limit connections from IPs on our local /24 network
-ALLOWED_IPS = [
-  "127.0.0.1/32",
-  "#{LISTEN_IP}/24",
-]
+  # by default, listen on the first non-loopback IPv4 address we can find or
+  # fallback to 127.0.0.1
+  :listen_port => 1080,
+  :listen_ip => (Socket.ip_address_list.
+    select{|a| a.ipv4? && !a.ipv4_loopback? }.
+    map{|i| i.ip_unpack[0] }.first || "127.0.0.1"),
+
+  :allowed_ranges => [],
+}
+
+while ARGV.any?
+  case ARGV[0]
+  when "-a"
+    ARGV.shift
+    begin
+      ipr = IPAddr.new(ARGV[0])
+      CONFIG[:allowed_ranges].push ipr
+    rescue IPAddr::InvalidAddressError
+      STDERR.puts "invalid IP range #{ARGV[0]}"
+      usage
+    end
+    ARGV.shift
+  when "-d"
+    ARGV.shift
+    CONFIG[:debug] = true
+  when "-p"
+    ARGV.shift
+    if !ARGV[0].to_s.match(/^\d+/)
+      STDERR.puts "invalid port value"
+      usage
+    end
+    CONFIG[:port] = ARGV.shift
+  when "-i"
+    ARGV.shift
+    begin
+      ip = IPAddr.new(ARGV[0])
+    rescue IPAddr::InvalidAddressError
+      STDERR.puts "invalid IP #{ARGV[0]}"
+      usage
+    end
+    CONFIG[:listen_ip] = ARGV.shift
+  else
+    usage
+  end
+end
+
+# unless specified otherwise, allow connections from the listen ip's network
+if !CONFIG[:allowed_ranges].any?
+  CONFIG[:allowed_ranges].push IPAddr.new("127.0.0.1/32")
+  CONFIG[:allowed_ranges].push IPAddr.new("#{CONFIG[:listen_ip]}/24")
+end
 
 LOGGER = Logger.new(STDOUT)
-if ARGV[0] == "-d"
-  LOGGER.level = Logger::DEBUG
-else
-  LOGGER.level = Logger::INFO
-end
+LOGGER.level = (CONFIG[:debug] ? Logger::DEBUG : Logger::INFO)
 LOGGER.datetime_format = "%Y-%m-%d %H:%M:%S"
 LOGGER.formatter = proc do |severity, datetime, progname, msg|
   "[#{datetime}] [#{severity[0]}] #{msg}\n"
@@ -188,8 +230,8 @@ module EMSOCKS5Connection
   end
 
   def allow_connection?
-    ALLOWED_IPS.each do |r|
-      if IPAddr.new(r).to_range.include?(ip)
+    CONFIG[:allowed_ranges].each do |r|
+      if r.to_range.include?(ip)
         return true
       end
     end
@@ -198,7 +240,7 @@ module EMSOCKS5Connection
   end
 
   def do_connect
-    if TLS_PORTS.include?(remote_port)
+    if CONFIG[:tls_ports].include?(remote_port)
       @tls_decrypt = true
     end
 
@@ -391,6 +433,9 @@ if RUBY_PLATFORM.match(/bsd/i)
 end
 
 EM.run do
-  EM.start_server(LISTEN_IP, LISTEN_PORT, EMSOCKS5Connection)
-  LOGGER.info "[server] listening on #{LISTEN_IP}:#{LISTEN_PORT}"
+  EM.start_server(CONFIG[:listen_ip], CONFIG[:listen_port], EMSOCKS5Connection)
+  LOGGER.info "[server] listening on #{CONFIG[:listen_ip]}:" <<
+    "#{CONFIG[:listen_port]}"
+  LOGGER.info "[server] allowing connections from " <<
+    CONFIG[:allowed_ranges].map{|i| "#{i.to_s}/#{i.prefix}" }.join(", ")
 end
