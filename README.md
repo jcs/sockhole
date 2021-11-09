@@ -26,7 +26,14 @@ port configured in the POP3 client to 995 (POP3S).
 
 	server$ bundle exec ruby sockhole.rb
 
-The `-d` option can be supplied to print debugging information.
+Supported options:
+
+- `-a allowed range`: add the IP/mask to the list of allowed IPs; defaults to
+  the /24 of the listen IP
+- `-d`: enable debugging
+- `-p port`: set the listen port (defaults to 1080)
+- `-i ip`: set the listen IP (defaults to the first non-loopback IP on all
+  interfaces)
 
 ### Client Examples
 
